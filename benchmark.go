@@ -7,28 +7,36 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/ollama/ollama/api"
+	"golang.org/x/sync/semaphore"
 )
 
 type timing struct {
-	promptRate []float64
-	evalRate   []float64
-	record     bool
+	mu           sync.Mutex
+	promptTokens int
+	promptRate   []float64
+	evalTokens   int
+	evalRate     []float64
+	record       bool
 }
 
 func (stats *timing) reply(resp api.GenerateResponse) error {
 	if resp.Done {
+		stats.mu.Lock()
+		defer stats.mu.Unlock()
+
 		if stats.record {
 			if resp.Metrics.PromptEvalDuration > 0 {
+				stats.promptTokens += resp.Metrics.PromptEvalCount
 				rate := float64(resp.Metrics.PromptEvalCount) / resp.Metrics.PromptEvalDuration.Seconds()
-				//fmt.Printf("prompt eval duration: %s\n", resp.Metrics.PromptEvalDuration)
-				//fmt.Printf("prompt eval rate:     %.2f tokens/s\n", rate)
-
 				stats.promptRate = append(stats.promptRate, rate)
 			}
 
 			if resp.Metrics.EvalDuration > 0 {
+				stats.evalTokens += resp.Metrics.EvalCount
 				rate := float64(resp.Metrics.EvalCount) / resp.Metrics.EvalDuration.Seconds()
 				stats.evalRate = append(stats.evalRate, rate)
 			}
@@ -48,6 +56,7 @@ func main() {
 	model := flag.String("model", "llama3.1", "Model to benchmark")
 	benchPrompt := flag.Bool("prompt", false, "Benchmark a long prompt (vs. long generation)")
 	runs := flag.Int("runs", 10, "Number of runs")
+	parallel := flag.Int("parallel", 1, "Runs to do in parallel")
 
 	flag.Parse()
 
@@ -80,25 +89,51 @@ func main() {
 		Options: map[string]any{
 			"temperature": 0,
 			"seed":        0,
+			"num_predict": 400,
+			"num_ctx": 512,
 		}}
 
 	stats := timing{}
 
-	for i := range *runs + 1 {
-		req.Prompt = prompt.P[i%len(prompt.P)]
-		err = client.Generate(ctx, &req, stats.reply)
-		if err != nil {
-			panic(err)
-		}
+	var wg sync.WaitGroup
+	sem := semaphore.NewWeighted(int64(*parallel))
+
+	wg.Add(*runs)
+
+	req.Prompt = prompt.P[0]
+	err = client.Generate(ctx, &req, stats.reply)
+	if err != nil {
+		panic(err)
 	}
+
+	startTime := time.Now()
+	for i := range *runs {
+		go func() {
+			send := req
+			send.Prompt = prompt.P[(i+1)%len(prompt.P)]
+			sem.Acquire(ctx, 1)
+			err = client.Generate(ctx, &send, stats.reply)
+			sem.Release(1)
+			if err != nil {
+				panic(err)
+			}
+			wg.Done()
+		}()
+	}
+
+	wg.Wait()
+	totalTime := time.Since(startTime)
 
 	if *benchPrompt {
 		fmt.Print("prompt ")
 		printStats(stats.promptRate)
+		fmt.Printf("\nTPS: %v\n", float32(stats.promptTokens)/float32(totalTime.Seconds()))
 	} else {
 		fmt.Print("eval ")
 		printStats(stats.evalRate)
+		fmt.Printf("\nTPS: %v\n", float32(stats.evalTokens)/float32(totalTime.Seconds()))
 	}
+
 }
 
 func printStats(rates []float64) {
